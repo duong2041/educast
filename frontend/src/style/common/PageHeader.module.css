@@ -1,0 +1,135 @@
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--header-height);
+  padding: 0 40px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  flex-shrink: 0;
+}
+
+.logoImage {
+  width: 160px;
+  height: auto;
+  object-fit: contain;
+  display: block;
+}
+
+.nav {
+  display: flex;
+  gap: 32px;
+  align-items: center;
+}
+
+.navLink {
+  position: relative;
+  font-size: 14px;
+  color: var(--text-secondary);
+  transition: color 0.2s;
+  text-decoration: none;
+  padding: 4px 0;
+}
+
+.navLink:hover {
+  color: var(--text-primary);
+}
+
+.navLink::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 0;
+  height: 2px;
+  background-color: #f4a227;
+  transition: width 0.3s ease;
+}
+
+.navLink:hover::after {
+  width: 100%;
+}
+
+.ctaBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--radius-full);
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.2s;
+}
+
+.ctaBtn:hover {
+  background: var(--accent-light);
+}
+
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.loginBtn,
+.freeBtn {
+  text-decoration: none;
+  border-radius: 999px;
+  padding: 12px 22px;
+  font-weight: 600;
+  transition: 0.2s ease;
+}
+
+.loginBtn {
+  color: #f5f0e8;
+  border: 1px solid rgba(245, 240, 232, 0.18);
+  background: transparent;
+}
+
+.freeBtn {
+  color: #111827;
+  background: #f4a227;
+  border: none;
+}
+
+.loginBtn:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.freeBtn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(244, 162, 39, 0.22);
+}
+
+@media (max-width: 768px) {
+  .header {
+    padding: 0 16px !important;
+  }
+
+  .nav {
+    display: none !important;
+  }
+
+  .logoImage {
+    width: 120px !important;
+  }
+
+  .loginBtn,
+  .freeBtn {
+    padding: 8px 14px !important;
+    font-size: 12px !important;
+  }
+}

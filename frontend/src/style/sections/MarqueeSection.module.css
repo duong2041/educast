@@ -1,0 +1,57 @@
+.marqueeSection {
+  overflow: hidden;
+  padding: 20px 0;
+  margin: 64px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.02);
+  width: 100vw;
+  position: relative;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.marqueeTrack {
+  width: max-content;
+  display: flex;
+  gap: 16px;
+  animation: scroll 28s linear infinite;
+}
+
+.marqueeItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #f5f0e8;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  border: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.marqueeItem:hover {
+  background: rgba(244, 162, 39, 0.12);
+  color: #ffc061;
+  border-color: rgba(244, 162, 39, 0.25);
+  transform: translateY(-1px);
+}
+
+.marqueeDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #00c4a7;
+}
+
+@keyframes scroll {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-50%);
+  }
+}

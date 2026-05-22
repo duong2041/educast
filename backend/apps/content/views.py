@@ -1,0 +1,1815 @@
+import os
+import tempfile
+import ulid
+from apps.social.models import HiddenPost, PostLike, SavedPost, Comment, PostShare
+from apps.social.post_share_compat import post_share_qs, post_shares_has_shared_from_share_id_column
+
+from django.db import transaction, models
+from django.utils import timezone
+from django.utils.text import slugify
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from apps.content.services.feed_service import FeedService
+from .models import Post, PostAudioVersion, PostDocument, Tag, PostTag, Topic
+from apps.social.models import HiddenPost
+from apps.social.services import create_new_post_notifications_for_admins
+from .serializers import (
+    DraftCreateSerializer,
+    AudioPreviewSerializer,
+    SaveDraftWithAudioSerializer,
+    DraftDetailSerializer,
+    DraftUpdateSerializer,
+    UploadDocumentSerializer,
+    FeedItemSerializer,
+    PublishPostSerializer,
+    TopicSerializer,
+    TagSerializer,
+)
+from .services.cloudinary_service import (
+    upload_file_to_cloudinary,
+    delete_file_from_cloudinary,
+    get_audio_duration_from_api,
+)
+
+
+class TrendingTagsView(APIView):
+    def get(self, request):
+        try:
+            # We filter out tags with 0 published posts to keep the trending list relevant
+            trending_tags = Tag.objects.filter(
+                tag_posts__post__status='published'
+            ).annotate(
+                usage_count=models.Count('tag_posts', filter=models.Q(tag_posts__post__status='published'))
+            ).filter(usage_count__gt=0).order_by('-usage_count')[:10]
+            
+            data = []
+            for tag in trending_tags:
+                # Format counts nicely for UI (e.g. 1.2k)
+                usage_count = tag.usage_count
+                formatted_count = str(usage_count)
+                if usage_count >= 1000:
+                    formatted_count = f"{usage_count / 1000:.1f}k".replace(".0", "")
+                
+                data.append({
+                    'tag': f"#{tag.name}",
+                    'slug': tag.slug,
+                    'count': formatted_count,
+                    'raw_count': usage_count
+                })
+                
+            return Response({
+                'success': True,
+                'data': data
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class TagDetailView(APIView):
+    def get(self, request, slug):
+        try:
+            tag = Tag.objects.annotate(
+                usage_count=models.Count('tag_posts')
+            ).filter(slug=slug).first()
+            
+            if not tag:
+                return Response({
+                    'success': False,
+                    'message': 'Tag not found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            return Response({
+                'success': True,
+                'data': {
+                    'id': tag.id,
+                    'name': tag.name,
+                    'slug': tag.slug,
+                    'usage_count': tag.usage_count
+                }
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                'success': False,
+                'message': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class TestCloudinaryUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        try:
+            audio_file = request.FILES.get('audio')
+            if not audio_file:
+                return Response(
+                    {'error': 'Không tìm thấy file audio'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Validate file type
+            if not audio_file.content_type.startswith('audio/'):
+                return Response(
+                    {'error': 'File phải là audio'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Validate file size (50MB max)
+            max_size = 50 * 1024 * 1024
+            if audio_file.size > max_size:
+                return Response(
+                    {'error': 'File quá lớn. Tối đa 50MB'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Upload to Cloudinary
+            result = upload_file_to_cloudinary(
+                audio_file,
+                resource_type='auto',
+                folder='educast/audios',
+            )
+
+            return Response(
+                {
+                    'message': 'Upload thành công',
+                    'audio_url': result.get('secure_url'),
+                    'public_id': result.get('public_id'),
+                    'duration': result.get('duration'),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class ThumbnailUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        try:
+            image_file = request.FILES.get('thumbnail')
+            if not image_file:
+                return Response(
+                    {'error': 'Không tìm thấy file ảnh'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Validate file type
+            if not image_file.content_type.startswith('image/'):
+                return Response(
+                    {'error': 'File phải là ảnh (PNG, JPG, WebP, v.v.)'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Validate file size (5MB max for images)
+            max_size = 5 * 1024 * 1024
+            if image_file.size > max_size:
+                return Response(
+                    {'error': 'File quá lớn. Tối đa 5MB'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Upload to Cloudinary
+            result = upload_file_to_cloudinary(
+                image_file,
+                resource_type='image',
+                folder='educast/thumbnails',
+            )
+
+            return Response(
+                {
+                    'message': 'Upload ảnh thành công',
+                    'thumbnail_url': result.get('secure_url'),
+                    'public_id': result.get('public_id'),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+from .services.text_processor import (
+    process_text_by_mode,
+    generate_ai_description,
+    generate_ai_title,
+)
+from .services.tts_service import generate_audio_file
+from .services.slug_service import generate_unique_slug
+from .services.document_parser import extract_text_from_file
+
+
+def estimate_duration_seconds(text: str) -> int:
+    text = (text or "").strip()
+    if not text:
+        return 0
+
+    words = len(text.split())
+    return max(5, round(words / 2.2))
+
+
+def build_fallback_description(text: str, max_length: int = 180) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    compact = " ".join(text.split())
+    if len(compact) <= max_length:
+        return compact
+
+    shortened = compact[:max_length].rsplit(" ", 1)[0].strip()
+    return shortened + "..."
+
+def handle_tags(post, tag_names):
+    for raw_tag in tag_names:
+        tag_name = (raw_tag or "").strip().lower()
+        tag_name = tag_name.lstrip("#")
+        tag_name = " ".join(tag_name.split())
+
+        if not tag_name:
+            continue
+
+        slug = slugify(tag_name)
+
+        tag = Tag.objects.filter(slug=slug).first()
+
+        if not tag:
+            tag = Tag.objects.create(
+                id=str(ulid.new()),
+                slug=slug,
+                name=tag_name,
+                created_at=timezone.now(),
+            )
+
+        PostTag.objects.get_or_create(
+            post=post,
+            tag=tag,
+            defaults={"created_at": timezone.now()},
+        )
+
+def handle_topics(post, topic_ids):
+    final_topic_ids = list(topic_ids or [])
+
+    post.post_topics.all().delete()
+
+    valid_topics = Topic.objects.filter(id__in=final_topic_ids)
+    for topic in valid_topics:
+        post.post_topics.create(
+            topic=topic,
+            created_at=timezone.now(),
+        )
+        
+class DraftCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = DraftCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        title = (data.get("title") or "").strip() or "Bản nháp audio"
+        slug = generate_unique_slug(title)
+        now = timezone.now()
+
+        try:
+            post = Post.objects.create(
+                id=str(ulid.new()),
+                user=request.user,
+                title=title,
+                slug=slug,
+                description=(data.get("description") or "").strip(),
+                original_text=data.get("original_text", ""),
+                summary_text=None,
+                dialogue_script=None,
+                transcript_text=None,
+                source_type=data.get("source_type", Post.SourceTypeChoices.MANUAL),
+                is_ai_generated=False,
+                language_code="vi",
+                visibility=Post.VisibilityChoices.PRIVATE,
+                status=Post.StatusChoices.DRAFT,
+                learning_field=None,
+                audio_url=None,
+                thumbnail_url=None,
+                duration_seconds=None,
+                download_count=0,
+                view_count=0,
+                listen_count=0,
+                like_count=0,
+                comment_count=0,
+                save_count=0,
+                share_count=0,
+                published_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+
+            return Response(
+                {
+                    "message": "Lưu nháp thành công",
+                    "data": DraftDetailSerializer(post).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+import threading
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
+
+def generate_audio_background(task_id, data):
+    channel_layer = get_channel_layer()
+    group_name = f"audio_progress_{task_id}"
+
+    def send_progress(progress, step, status="generating", extra_data=None):
+        payload = {
+            "type": "progress_update",
+            "progress": progress,
+            "step": step,
+            "status": status,
+        }
+        if extra_data:
+            payload["data"] = extra_data
+        async_to_sync(channel_layer.group_send)(group_name, payload)
+
+    try:
+        send_progress(5, "Đang khởi tạo...")
+        
+        original_text = data["original_text"].strip()
+        was_truncated = len(original_text) > 12000
+        original_text = original_text[:12000]
+
+        send_progress(10, "Đang xử lý văn bản (AI)...")
+        processed_text = process_text_by_mode(
+            original_text,
+            data["mode"],
+        )
+        processed_text = (processed_text or "").strip()
+        if not processed_text:
+            processed_text = original_text.strip()
+        if not processed_text:
+            raise ValueError("Không thể tạo nội dung audio từ văn bản đầu vào.")
+
+        send_progress(40, "Đang tạo tiêu đề và mô tả...")
+        try:
+            generated_title = generate_ai_title(processed_text)
+            generated_title = (generated_title or "").strip()
+        except Exception:
+            generated_title = ""
+        if not generated_title:
+            generated_title = processed_text[:80].rsplit(" ", 1)[0].strip() or "Bài audio"
+
+        try:
+            generated_description = generate_ai_description(processed_text)
+            generated_description = (generated_description or "").strip()
+        except Exception:
+            generated_description = ""
+        if not generated_description:
+            generated_description = build_fallback_description(processed_text, max_length=220)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            temp_audio_path = tmp.name
+
+        try:
+            send_progress(50, "Đang tạo giọng nói (TTS)...")
+            generate_audio_file(
+                text=processed_text,
+                voice_name=data["voice_name"],
+                output_path=temp_audio_path,
+            )
+
+            if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) == 0:
+                raise ValueError("TTS không tạo ra file audio hợp lệ.")
+
+            send_progress(80, "Đang tải file lên Cloudinary...")
+            uploaded = upload_file_to_cloudinary(
+                file=temp_audio_path,
+                folder="educast/audio_preview",
+                resource_type="video",
+            )
+
+            audio_url = uploaded.get("secure_url")
+            if not audio_url:
+                raise ValueError("Upload Cloudinary thành công nhưng không nhận được secure_url.")
+            
+            duration_seconds = uploaded.get("duration")
+            if not duration_seconds:
+                public_id = uploaded.get("public_id")
+                if public_id:
+                    duration_seconds = get_audio_duration_from_api(public_id, resource_type="video")
+            
+            if not duration_seconds:
+                duration_seconds = estimate_duration_seconds(processed_text)
+            else:
+                duration_seconds = int(duration_seconds)
+
+            final_data = {
+                "mode": data["mode"],
+                "processed_text": processed_text,
+                "generated_title": generated_title,
+                "transcript_text": processed_text,  
+                "generated_description": generated_description,
+                "audio_url": audio_url,
+                "public_id": uploaded.get("public_id"),
+                "voice_name": data["voice_name"],
+                "format": uploaded.get("format") or "mp3",
+                "bytes": uploaded.get("bytes"),
+                "duration_seconds": duration_seconds,
+                "was_truncated": was_truncated,
+            }
+
+            send_progress(100, "Hoàn tất!", status="done", extra_data=final_data)
+
+        finally:
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
+
+    except Exception as e:
+        send_progress(0, str(e), status="error")
+
+
+class AudioPreviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = AudioPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        
+        task_id = request.data.get("task_id")
+        
+        if not task_id:
+            # Fallback
+            task_id = str(ulid.new())
+
+        # Start background thread
+        thread = threading.Thread(
+            target=generate_audio_background,
+            args=(task_id, data)
+        )
+        thread.start()
+
+        return Response(
+            {
+                "message": "Đã bắt đầu tiến trình tạo audio",
+                "task_id": task_id
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class DraftSaveWithAudioView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = SaveDraftWithAudioSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        title = (data.get("title") or "").strip() or "Bản nháp audio"
+        slug = generate_unique_slug(title)
+        mode = data.get("mode", "summary")
+        processed_text = data.get("processed_text", "")
+        
+        # Priority: client value > API query > estimate
+        duration_seconds = data.get("duration_seconds")
+        if not duration_seconds:
+            public_id = data.get("public_id")
+            if public_id:
+                duration_seconds = get_audio_duration_from_api(public_id, resource_type="video")
+        
+        if not duration_seconds:
+            duration_seconds = estimate_duration_seconds(processed_text)
+        
+        now = timezone.now()
+
+        summary_text = data.get("summary_text") or (processed_text if mode == "summary" else None)
+        dialogue_script = data.get("dialogue_script") or (processed_text if mode == "dialogue" else None)
+        transcript_text = data.get("transcript_text") or processed_text
+
+        final_description = (data.get("description") or "").strip()
+        if not final_description:
+            final_description = build_fallback_description(
+                processed_text or data.get("original_text", "")
+            )
+
+        try:
+            post = Post.objects.create(
+                id=str(ulid.new()),
+                user=request.user,
+                title=title,
+                slug=slug,
+                description=final_description,
+                original_text=data.get("original_text", ""),
+                summary_text=summary_text,
+                dialogue_script=dialogue_script,
+                transcript_text=transcript_text,
+                source_type=data.get("source_type", Post.SourceTypeChoices.MANUAL),
+                is_ai_generated=(mode != "original"),
+                language_code="en" if mode == "translate" else "vi",
+                visibility=Post.VisibilityChoices.PRIVATE,
+                status=Post.StatusChoices.DRAFT,
+                learning_field=None,
+                audio_url=data["audio_url"],
+                thumbnail_url=None,
+                duration_seconds=duration_seconds,
+                download_count=0,
+                view_count=0,
+                listen_count=0,
+                like_count=0,
+                comment_count=0,
+                save_count=0,
+                share_count=0,
+                published_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+
+            PostAudioVersion.objects.create(
+                id=str(ulid.new()),
+                post=post,
+                voice_name=data.get("voice_name", "Minh Tuấn"),
+                format=data.get("format", "mp3"),
+                bitrate_kbps=None,
+                duration_seconds=duration_seconds,
+                audio_url=data["audio_url"],
+                storage_path=data.get("public_id"),
+                is_default=True,
+                created_at=now,
+            )
+
+            handle_topics(
+                post=post,
+                topic_ids=data.get("topic_ids", []),
+            )
+
+            if data.get("source_type") == Post.SourceTypeChoices.UPLOADED_DOCUMENT:
+                document_url = (data.get("document_url") or "").strip()
+                if document_url:
+                    PostDocument.objects.create(
+                        id=str(ulid.new()),
+                        post=post,
+                        file_name=data.get("file_name", ""),
+                        file_type=data.get("file_type", ""),
+                        file_size=data.get("file_size") or 0,
+                        document_url=document_url,
+                        storage_path=data.get("document_public_id", ""),
+                        uploaded_at=now,
+                    )
+
+            return Response(
+                {
+                    "message": "Lưu nháp có audio thành công",
+                    "data": DraftDetailSerializer(post).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class MyDraftListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            # Exclude archived drafts from the list
+            drafts = Post.objects.filter(
+                user=request.user,
+            ).exclude(
+                status=Post.StatusChoices.ARCHIVED,
+            ).order_by("-created_at")
+
+            return Response(
+                {
+                    "message": "Lấy danh sách nháp thành công",
+                    "data": DraftDetailSerializer(drafts, many=True).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class DraftDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, post_id):
+        try:
+            post = Post.objects.get(
+                id=post_id,
+                user=request.user,
+            )
+
+            return Response(
+                {
+                    "message": "Lấy chi tiết nháp thành công",
+                    "data": DraftDetailSerializer(post).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Post.DoesNotExist:
+            return Response(
+                {"error": "Không tìm thấy bản nháp"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class DraftUpdateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def put(self, request, post_id):
+        try:
+            post = Post.objects.get(
+                id=post_id,
+                user=request.user,
+            )
+        except Post.DoesNotExist:
+            return Response(
+                {"error": "Không tìm thấy bản nháp"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = DraftUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            text_changed = False
+
+            # Handle status update (e.g., archiving)
+            if "status" in data and data["status"]:
+                post.status = data["status"]
+
+            if "title" in data and data["title"]:
+                post.title = data["title"]
+                post.slug = generate_unique_slug(data["title"])
+
+            if "description" in data:
+                post.description = data["description"]
+
+            if "original_text" in data:
+                new_text = (data["original_text"] or "").strip()
+                old_text = (post.original_text or "").strip()
+
+                if new_text != old_text:
+                    text_changed = True
+                    post.original_text = new_text
+
+            if text_changed:
+                old_audio_versions = PostAudioVersion.objects.filter(post=post)
+
+                for audio in old_audio_versions:
+                    if audio.storage_path:
+                        delete_file_from_cloudinary(
+                            public_id=audio.storage_path,
+                            resource_type="video",
+                        )
+
+                old_audio_versions.update(is_default=False)
+
+                post.summary_text = None
+                post.dialogue_script = None
+                post.transcript_text = None
+                post.audio_url = None
+                post.duration_seconds = None
+                post.is_ai_generated = False
+
+            if "summary_text" in data:
+                post.summary_text = data["summary_text"]
+
+            if "dialogue_script" in data:
+                post.dialogue_script = data["dialogue_script"]
+
+            if "transcript_text" in data:
+                post.transcript_text = data["transcript_text"]
+
+            if "audio_url" in data and data["audio_url"]:
+                old_default_audio = PostAudioVersion.objects.filter(
+                    post=post,
+                    is_default=True,
+                ).first()
+
+                if old_default_audio and old_default_audio.storage_path:
+                    delete_file_from_cloudinary(
+                        public_id=old_default_audio.storage_path,
+                        resource_type="video",
+                    )
+
+                post.audio_url = data["audio_url"]
+                
+                # Priority: client value > API query > estimate
+                post.duration_seconds = data.get("duration_seconds")
+                if not post.duration_seconds:
+                    public_id = data.get("public_id")
+                    if public_id:
+                        post.duration_seconds = get_audio_duration_from_api(public_id, resource_type="video")
+                
+                if not post.duration_seconds:
+                    post.duration_seconds = estimate_duration_seconds(
+                        data.get("summary_text")
+                        or data.get("dialogue_script")
+                        or data.get("transcript_text")
+                        or post.original_text
+                    )
+                
+                post.is_ai_generated = True
+
+                PostAudioVersion.objects.filter(post=post).update(is_default=False)
+
+                PostAudioVersion.objects.create(
+                    id=str(ulid.new()),
+                    post=post,
+                    voice_name=data.get("voice_name") or "Minh Tuấn",
+                    format=data.get("format") or "mp3",
+                    bitrate_kbps=None,
+                    duration_seconds=post.duration_seconds,
+                    audio_url=data["audio_url"],
+                    storage_path=data.get("public_id"),
+                    is_default=True,
+                    created_at=timezone.now(),
+                )
+
+            post.updated_at = timezone.now()
+            post.save()
+
+            return Response(
+                {
+                    "message": "Cập nhật bản nháp thành công",
+                    "data": DraftDetailSerializer(post).data,
+                    "success": True,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class DraftDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def delete(self, request, post_id):
+        try:
+            post = Post.objects.get(
+                id=post_id,
+                user=request.user,
+            )
+        except Post.DoesNotExist:
+            return Response(
+                {"error": "Không tìm thấy bản nháp"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            # Chỉ chuyển status sang archived, không xóa file vật lý trên Cloudinary
+            # để đảm bảo toàn vẹn dữ liệu nếu muốn khôi phục.
+
+            post.status = "archived"
+            post.updated_at = timezone.now()
+            post.save(update_fields=["status", "updated_at"])
+
+            return Response(
+                {"message": "Xóa bản nháp thành công"},
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class UploadDocumentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = UploadDocumentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        file = serializer.validated_data["file"]
+
+        try:
+            extracted_text = extract_text_from_file(file)
+
+            if not extracted_text.strip():
+                return Response(
+                    {
+                        "error": "Không thể trích xuất nội dung từ file. Vui lòng dùng file PDF có text, hoặc thử .docx/.txt."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            file.seek(0)
+            uploaded = upload_file_to_cloudinary(
+                file=file,
+                folder="educast/documents",
+                resource_type="raw",
+            )
+
+            return Response(
+                {
+                    "message": "Upload file thành công",
+                    "data": {
+                        "file_name": file.name,
+                        "file_type": getattr(file, "content_type", "") or "",
+                        "file_size": file.size,
+                        "document_url": uploaded.get("secure_url"),
+                        "public_id": uploaded.get("public_id"),
+                        "extracted_text": extracted_text,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+class FeedAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            try:
+                limit = int(request.query_params.get("limit", 20))
+            except (TypeError, ValueError):
+                limit = 20
+            # Trần hợp lý: client có thể xin nhiều dòng khi không lọc tag (feed đầy đủ).
+            limit = max(1, min(limit, 150))
+            feed_type = request.query_params.get("tab", "for_you")
+            
+            tag_ids_param = request.query_params.get("tags", "")
+            tag_ids = None
+            if tag_ids_param:
+                try:
+                    tag_ids = [tid.strip() for tid in tag_ids_param.split(",") if tid.strip()]
+                except:
+                    tag_ids = None
+
+            topic_ids_param = request.query_params.get("topics", "")
+            topic_ids = None
+            if topic_ids_param:
+                try:
+                    topic_ids = [tid.strip() for tid in topic_ids_param.split(",") if tid.strip()]
+                except:
+                    topic_ids = None
+
+            tag_slugs_param = request.query_params.get("tag_slugs", "")
+            tag_slugs = None
+            if tag_slugs_param:
+                try:
+                    tag_slugs = [s.strip() for s in tag_slugs_param.split(",") if s.strip()]
+                except:
+                    tag_slugs = None
+
+            items = FeedService.get_feed(
+                user=request.user,
+                limit=limit,
+                feed_type=feed_type,
+                tag_ids=tag_ids,
+                topic_ids=topic_ids,
+                tag_slugs=tag_slugs,
+            )
+            
+            hidden_ids = set(
+                str(post_id).strip()
+                for post_id in HiddenPost.objects.filter(
+                    user_id=str(request.user.id)
+                ).values_list("post_id", flat=True)
+            )
+
+            # Ẩn theo id bài gốc: cả dòng original và shared (composite id) đều có post_id.
+            items = [
+                item
+                for item in items
+                if str(item.get("post_id") or item.get("id") or "").strip()
+                not in hidden_ids
+            ]
+
+            for item in items:
+                post_id = item.get("post_id") or item.get("id")
+
+                post = (
+                    Post.objects
+                    .filter(id=post_id)
+                    .select_related("user", "user__profile")
+                    .first()
+                )
+
+                if not post:
+                    continue
+
+                profile = getattr(post.user, "profile", None)
+
+                item["author"] = {
+                    "id": str(post.user.id),
+                    "username": post.user.username,
+                    "name": profile.display_name if profile and profile.display_name else post.user.username,
+                    "avatar_url": profile.avatar_url if profile else None,
+                }
+
+            serializer = FeedItemSerializer(items, many=True)
+            
+            return Response({
+                "items": serializer.data
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            import traceback
+            print(f" Feed error: {str(e)}")
+            traceback.print_exc()
+            return Response({
+                "error": f"Failed to load feed: {str(e)}"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SearchAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        query = request.query_params.get("q", "").strip()
+        search_type = request.query_params.get("type", "all")  # all, posts, authors, tags
+        limit = int(request.query_params.get("limit", 20))
+        offset = int(request.query_params.get("offset", 0))
+
+        if not query or len(query) < 2:
+            return Response({
+                "posts": [],
+                "authors": [],
+            }, status=status.HTTP_200_OK)
+
+        results = {
+            "posts": [],
+            "authors": [],
+        }
+
+        # Search Posts (Podcasts) - bao gồm posts với tag + posts của authors
+        if search_type in ["all", "posts"]:
+            from apps.social.views import _post_counts
+            from apps.content.models import Tag, PostTag
+            from apps.users.models import User
+            
+            # Tìm direct by title/description
+            posts_qs = Post.objects.filter(
+                status="published",
+                visibility="public"
+            ).exclude(
+                status="archived"
+            ).filter(
+                models.Q(title__icontains=query) |
+                models.Q(description__icontains=query)
+            ).select_related("user", "user__profile").order_by("-created_at")
+
+            hidden_post_ids = HiddenPost.objects.filter(
+                user_id=request.user.id
+            ).values_list("post_id", flat=True)
+
+            posts_qs = posts_qs.exclude(id__in=hidden_post_ids)
+            
+            # Thêm posts của authors có display_name chứa query
+            authors_matching = User.objects.filter(
+                models.Q(username__icontains=query) |
+                models.Q(profile__display_name__icontains=query)
+            )
+            if authors_matching.exists():
+                author_post_ids = Post.objects.filter(
+                    user__in=authors_matching,
+                    status="published",
+                    visibility="public"
+                ).exclude(id__in=hidden_post_ids).values_list("id", flat=True)
+                
+                posts_by_author = Post.objects.filter(
+                    id__in=author_post_ids
+                ).select_related("user", "user__profile").order_by("-created_at")
+                
+                posts_qs = posts_qs | posts_by_author
+            
+            # Nếu tìm tag, thêm posts của tag đó
+            tags = Tag.objects.filter(name__icontains=query)
+            if tags.exists():
+                tag_post_ids = PostTag.objects.filter(
+                    tag__in=tags
+                ).values_list("post_id", flat=True)
+                
+                posts_with_tag = Post.objects.filter(
+                    id__in=tag_post_ids,
+                    status="published",
+                    visibility="public"
+                ).exclude(id__in=hidden_post_ids).select_related("user", "user__profile").order_by("-created_at")
+                
+                posts_qs = posts_qs | posts_with_tag
+            
+            posts_qs = posts_qs.distinct().order_by("-created_at")[offset:offset+limit]
+
+            posts_data = []
+            for post in posts_qs:
+                author_name = post.user.username
+                if hasattr(post.user, 'profile') and post.user.profile:
+                    author_name = post.user.profile.display_name or post.user.username
+
+                # Cùng logic feed / modal / likers: chỉ bài gốc (share_id NULL),
+                # không gộp like-comment-save của từng lần chia sẻ vào cùng post_id.
+                counts = _post_counts(post.id)
+                is_liked = PostLike.objects.filter(
+                    user_id=request.user.id,
+                    post_id=post.id,
+                    share_id__isnull=True,
+                ).exists()
+
+                is_saved = SavedPost.objects.filter(
+                    user_id=request.user.id,
+                    post_id=post.id,
+                    share_id__isnull=True,
+                ).exists()
+
+                posts_data.append({
+                    "id": post.id,
+                    "title": post.title,
+                    "description": post.description,
+                    "author": author_name,
+                    "author_id": post.user.id,
+                    "thumbnail_url": post.thumbnail_url,
+                    "listen_count": post.listen_count,
+                    "duration_seconds": post.duration_seconds,
+                    "created_at": post.created_at.isoformat(),
+
+                    "like_count": counts["like_count"],
+                    "comment_count": counts["comment_count"],
+                    "save_count": counts["save_count"],
+                    "share_count": counts["share_count"],
+
+                    "is_liked": is_liked,
+                    "is_saved": is_saved,
+                })
+            results["posts"] = posts_data
+
+        # Search Authors
+        if search_type in ["all", "authors"]:
+            from apps.users.models import User
+            from django.db.models import Q
+            
+            authors_qs = User.objects.filter(
+                Q(username__icontains=query) |
+                Q(profile__display_name__icontains=query)
+            ).select_related("profile")[:limit]
+
+            authors_data = []
+            for author in authors_qs:
+                avatar_url = None
+                if hasattr(author, 'profile') and author.profile:
+                    avatar_url = author.profile.avatar_url
+                
+                display_name = getattr(author.profile, 'display_name', None) if hasattr(author, 'profile') and author.profile else author.username
+                
+                if avatar_url and (':\\' in avatar_url or avatar_url.startswith('/')):
+                    avatar_url = None
+                
+                if not avatar_url:
+                    avatar_url = f'https://ui-avatars.com/api/?name={display_name.replace(" ", "%20")}&background=667eea&color=fff&size=96'
+                
+                print(f"DEBUG: {author.username} - avatar_url: {avatar_url}")
+                
+                authors_data.append({
+                    "id": author.id,
+                    "username": author.username,
+                    "display_name": display_name,
+                    "avatar_url": avatar_url,
+                })
+            
+            results["authors"] = authors_data
+
+        return Response(results, status=status.HTTP_200_OK)
+
+class UserPostsAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+    
+    def _build_post_data(self, post, request_user_id, share_info=None):
+        """Helper to build complete post data"""
+        author_name = post.user.username
+        author_username = post.user.username  # Always include username
+        if hasattr(post.user, 'profile') and post.user.profile:
+            author_name = post.user.profile.display_name or post.user.username
+        
+        author_avatar = None
+        if hasattr(post.user, 'profile') and post.user.profile:
+            author_avatar = post.user.profile.avatar_url
+        
+        # Bài share trên profile: đếm / trạng thái like-lưu theo đúng instance chia sẻ.
+        if share_info and share_info.get("share_id"):
+            share_id = share_info.get("share_id")
+            is_liked = PostLike.objects.filter(
+                user_id=request_user_id,
+                post_id=post.id,
+            ).exists() if request_user_id else False
+            is_saved = SavedPost.objects.filter(
+                user_id=request_user_id,
+                share_id=share_id,
+            ).exists() if request_user_id else False
+            like_count = PostLike.objects.filter(share_id=share_id).count()
+            if is_liked and request_user_id:
+                viewer_like_on_share = PostLike.objects.filter(
+                    user_id=request_user_id, post_id=post.id, share_id=share_id
+                ).exists()
+                if not viewer_like_on_share:
+                    like_count += 1
+            comment_count = Comment.objects.filter(share_id=share_id).count()
+            save_count = SavedPost.objects.filter(share_id=share_id).count()
+            # Share count cho "bài share": re-share (cần cột shared_from_share_id).
+            if post_shares_has_shared_from_share_id_column():
+                try:
+                    share_count = PostShare.objects.filter(
+                        shared_from_share_id=share_id,
+                        share_type="personal",
+                    ).count()
+                except Exception:
+                    share_count = 0
+            else:
+                share_count = 0
+        else:
+            is_liked = PostLike.objects.filter(
+                user_id=request_user_id,
+                post_id=post.id,
+            ).exists() if request_user_id else False
+            is_saved = SavedPost.objects.filter(
+                user_id=request_user_id,
+                post_id=post.id,
+                share_id__isnull=True,
+            ).exists() if request_user_id else False
+            like_count = PostLike.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            comment_count = Comment.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            save_count = SavedPost.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            # Share count cho bài gốc: gộp cả "personal" (đăng bài share) và "message" (gửi DM).
+            if post_shares_has_shared_from_share_id_column():
+                share_count = PostShare.objects.filter(
+                    post_id=post.id,
+                    share_type__in=["personal", "message"],
+                    shared_from_share_id__isnull=True,
+                ).count()
+            else:
+                share_count = PostShare.objects.filter(
+                    post_id=post.id,
+                    share_type__in=["personal", "message"],
+                ).count()
+        
+        post_data = {
+            "id": post.id,
+            "title": post.title,
+            "description": post.description,
+            "original_text": post.original_text,
+            "summary_text": post.summary_text,
+            "dialogue_script": post.dialogue_script,
+            "transcript_text": post.transcript_text,
+            "author": author_name,
+            "author_username": author_username,  # Add username field
+            "author_id": post.user.id,
+            "author_avatar": author_avatar,
+            "thumbnail_url": post.thumbnail_url,
+            "audio_url": post.audio_url,
+            "listen_count": post.listen_count,
+            "view_count": post.view_count,
+            "download_count": post.download_count,
+            "duration_seconds": post.duration_seconds,
+            "learning_field": post.learning_field,
+            "language_code": post.language_code,
+            "source_type": post.source_type,
+            "is_ai_generated": post.is_ai_generated,
+            "status": post.status,
+            "created_at": post.created_at.isoformat(),
+            "published_at": post.published_at.isoformat() if post.published_at else None,
+            "updated_at": post.updated_at.isoformat() if post.updated_at else None,
+            "like_count": like_count,
+            "comment_count": comment_count,
+            "save_count": save_count,
+            "share_count": share_count,
+            "is_liked": is_liked,
+            "is_saved": is_saved,
+            "tags": [{"id": tag.id, "name": tag.name, "slug": tag.slug} for tag in Tag.objects.filter(tag_posts__post_id=post.id)],
+        }
+        
+        # Add share info if provided
+        if share_info:
+            post_data.update(share_info)
+        
+        return post_data
+
+    def get(self, request, user_id=None):
+        """Get all posts (published) + shared posts of a user"""
+        try:
+            target_user_id = user_id or str(request.user.id)
+
+            from django.db.models import Q
+            from apps.users.models import User
+            target_user = User.objects.filter(
+                Q(id=target_user_id) | Q(username=target_user_id)
+            ).first()
+            if not target_user:
+                return Response({
+                    "error": "User not found",
+                    "posts": []
+                }, status=status.HTTP_404_NOT_FOUND)
+            target_user_id = str(target_user.id)
+            
+            # Get current user ID for checking likes/saves
+            current_user_id = request.user.id if request.user and request.user.is_authenticated else None
+            
+            # Get hidden post IDs for the viewing user (not the target user)
+            hidden_post_ids = set()
+            if current_user_id:
+                hidden_post_ids = set(
+                    HiddenPost.objects.filter(user_id=current_user_id)
+                    .values_list("post_id", flat=True)
+                )
+            
+            # Get user's published posts (exclude hidden posts)
+            if str(current_user_id) == str(target_user_id):
+                # If viewing own profile, show processing, published, and failed (rejected) posts
+                posts_qs = (
+                    Post.objects
+                    .filter(user_id=target_user_id)
+                    .filter(status__in=["published", "processing", "failed"])
+                    .select_related("user", "user__profile")
+                    .order_by("-created_at")
+                )
+            else:
+                posts_qs = (
+                    Post.objects
+                    .filter(user_id=target_user_id, status="published", visibility="public")
+                    .exclude(id__in=hidden_post_ids)
+                    .select_related("user", "user__profile")
+                    .order_by("-created_at")
+                )
+            
+            limit = int(request.query_params.get("limit", 100))
+            posts = list(posts_qs[:limit])
+            
+            posts_data = []
+            for post in posts:
+                post_data = self._build_post_data(post, current_user_id)
+                post_data["type"] = "original"
+                posts_data.append(post_data)
+            
+            # Get user's shared posts (exclude hidden posts)
+            # Include personal + message shares (DM/friends); both are "đã chia sẻ" trên trang cá nhân
+            shared_posts_qs = (
+                post_share_qs()
+                .filter(user_id=target_user_id)
+                .exclude(post_id__in=hidden_post_ids)
+                .select_related("post", "post__user", "post__user__profile")
+                .order_by("-created_at")
+            )
+            
+            shared_posts_list = list(shared_posts_qs[:limit])
+            
+            for share in shared_posts_list:
+                post = share.post
+                if not post:
+                    continue
+                
+                share_info = {
+                    "id": f"share_{share.id}_{post.id}",
+                    "share_id": share.id,
+                    "post_id": post.id,
+                    "shared_at": share.created_at.isoformat(),
+                    "share_caption": share.caption,
+                    "type": "shared",
+                    "commentModalScope": "share"
+                }
+                
+                post_data = self._build_post_data(post, current_user_id, share_info)
+                posts_data.append(post_data)
+            
+            # Sort by created_at (newest first), but for shared posts use shared_at
+            posts_data.sort(key=lambda x: x.get("shared_at") or x.get("created_at"), reverse=True)
+            
+            return Response({
+                "data": {
+                    "posts": posts_data
+                },
+                "success": True
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                "error": f"Failed to load user posts: {str(e)}",
+                "posts": []
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class UserSharedPostsAPIView(APIView):
+    """API để lấy danh sách bài viết mà user đã chia sẻ"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, user_id=None):
+        """Get all shared posts of a user"""
+        try:
+            target_user_id = user_id or str(request.user.id)
+            
+            from apps.users.models import User
+            try:
+                target_user = User.objects.get(id=target_user_id)
+            except User.DoesNotExist:
+                return Response({
+                    "error": "User not found",
+                    "shared_posts": []
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Lấy danh sách shared posts (chỉ "personal" mới hiển thị trên profile;
+            # share qua tin nhắn chỉ tăng share_count, không hiển thị thành dòng).
+            shared_posts_qs = (
+                post_share_qs()
+                .filter(user_id=target_user_id, share_type="personal")
+                .select_related("post", "post__user", "post__user__profile")
+                .order_by("-created_at")
+            )
+            
+            limit = int(request.query_params.get("limit", 100))
+            shared_posts = list(shared_posts_qs[:limit])
+            
+            posts_data = []
+            for share in shared_posts:
+                post = share.post
+                author_name = post.user.username
+                if hasattr(post.user, 'profile') and post.user.profile:
+                    author_name = post.user.profile.display_name or post.user.username
+                
+                is_liked = PostLike.objects.filter(
+                    user_id=request.user.id,
+                    post_id=post.id
+                ).exists()
+                
+                is_saved = SavedPost.objects.filter(
+                    user_id=request.user.id,
+                    post_id=post.id
+                ).exists()
+
+                # Share count cho "bài share" trên profile: re-share (cần cột shared_from_share_id).
+                if post_shares_has_shared_from_share_id_column():
+                    try:
+                        reshare_count = PostShare.objects.filter(
+                            shared_from_share_id=share.id,
+                            share_type="personal",
+                        ).count()
+                    except Exception:
+                        reshare_count = 0
+                else:
+                    reshare_count = 0
+                
+                posts_data.append({
+                    "id": f"share_{share.id}_{post.id}",
+                    "share_id": share.id,
+                    "post_id": post.id,
+                    "type": "shared",
+                    "commentModalScope": "share",
+                    "title": post.title,
+                    "description": post.description,
+                    "author": author_name,
+                    "author_id": post.user.id,
+                    "thumbnail_url": post.thumbnail_url,
+                    "listen_count": post.listen_count,
+                    "duration_seconds": post.duration_seconds,
+                    "created_at": post.created_at.isoformat(),
+                    "shared_at": share.created_at.isoformat(),
+                    "share_caption": share.caption,
+                    "like_count": PostLike.objects.filter(post_id=post.id, share_id=share.id).count(),
+                    "comment_count": Comment.objects.filter(share_id=share.id).count(),
+                    "save_count": SavedPost.objects.filter(share_id=share.id).count(),
+                    "share_count": reshare_count,
+                    "is_liked": is_liked,
+                    "is_saved": is_saved,
+                    "tags": [{"id": tag.id, "name": tag.name, "slug": tag.slug} for tag in Tag.objects.filter(tag_posts__post_id=post.id)],
+                })
+            
+            return Response({
+                "data": {
+                    "shared_posts": posts_data
+                },
+                "success": True
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                "error": f"Failed to load user shared posts: {str(e)}",
+                "shared_posts": []
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ArchivedPostsAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            # Lấy tất cả posts của user hiện tại có status là archived
+            posts = Post.objects.filter(
+                user=request.user,
+                status="archived"
+            ).select_related("user", "user__profile").order_by("-created_at")
+
+            posts_data = []
+            # Reuse logic to build post data if possible, or just build it here
+            for post in posts:
+                # Mocking a basic build_post_data since UserPostsAPIView is an instance
+                # Actually, better to just call the logic or refactor
+                author_name = post.user.username
+                if hasattr(post.user, 'profile') and post.user.profile:
+                    author_name = post.user.profile.display_name or post.user.username
+                
+                author_avatar = None
+                if hasattr(post.user, 'profile') and post.user.profile:
+                    author_avatar = post.user.profile.avatar_url
+
+                post_data = {
+                    "id": post.id,
+                    "title": post.title,
+                    "slug": post.slug,
+                    "description": post.description,
+                    "audio_url": post.audio_url,
+                    "thumbnail_url": post.thumbnail_url,
+                    "author_name": author_name,
+                    "author_username": post.user.username,
+                    "author_avatar": author_avatar,
+                    "view_count": post.view_count,
+                    "duration_seconds": post.duration_seconds,
+                    "status": post.status,
+                    "created_at": post.created_at.isoformat(),
+                    "updated_at": post.updated_at.isoformat() if post.updated_at else None,
+                    "tags": [{"id": tag.id, "name": tag.name} for tag in Tag.objects.filter(tag_posts__post_id=post.id)],
+                }
+                posts_data.append(post_data)
+
+            return Response({
+                "success": True,
+                "data": posts_data
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({
+                "success": False,
+                "error": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class PostDetailView(APIView):
+    """API để lấy chi tiết một bài viết"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, post_id):
+        """Get single post by ID with full details"""
+        try:
+            current_user_id = request.user.id if request.user and request.user.is_authenticated else None
+            
+            actual_post_id = post_id
+            share_id = None
+            if post_id.startswith('share_'):
+                parts = post_id.split('_')
+                if len(parts) >= 3:
+                    share_id = parts[1]
+                    actual_post_id = parts[-1]
+
+            post = Post.objects.get(id=actual_post_id)
+            if post.status != "published" or post.visibility != "public":
+                # Cho phép tác giả hoặc admin xem bài viết bị từ chối/riêng tư
+                is_admin = getattr(request.user, 'role', '').lower() == 'admin' if request.user else False
+                if not current_user_id or (post.user.id != current_user_id and not is_admin):
+                    raise Post.DoesNotExist
+            
+            if share_id:
+                share = PostShare.objects.select_related("user", "user__profile").get(id=share_id)
+                share_info = {
+                    "id": post_id,
+                    "share_id": share.id,
+                    "post_id": post.id,
+                    "shared_at": share.created_at.isoformat(),
+                    "share_caption": share.caption,
+                    "type": "shared",
+                    "commentModalScope": "share",
+                    "sharedBy": {
+                        "id": share.user.id,
+                        "username": share.user.username,
+                        "name": getattr(share.user.profile, "display_name", "") if hasattr(share.user, "profile") else share.user.username,
+                        "avatar_url": getattr(share.user.profile, "avatar_url", "") if hasattr(share.user, "profile") else "",
+                    }
+                }
+                post_data = UserPostsAPIView()._build_post_data(post, current_user_id, share_info)
+                return Response({
+                    "data": post_data,
+                    "success": True
+                }, status=status.HTTP_200_OK)
+
+            author_name = post.user.username
+            if hasattr(post.user, 'profile') and post.user.profile:
+                author_name = post.user.profile.display_name or post.user.username
+            
+            author_avatar = None
+            if hasattr(post.user, 'profile') and post.user.profile:
+                author_avatar = post.user.profile.avatar_url
+            
+            is_liked = PostLike.objects.filter(
+                user_id=current_user_id,
+                post_id=post.id,
+            ).exists() if current_user_id else False
+            
+            is_saved = SavedPost.objects.filter(
+                user_id=current_user_id,
+                post_id=post.id,
+                share_id__isnull=True
+            ).exists() if current_user_id else False
+            
+            like_count = PostLike.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            comment_count = Comment.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            save_count = SavedPost.objects.filter(post_id=post.id, share_id__isnull=True).count()
+            # Share count cho bài gốc: gộp cả "personal" (đăng bài share) và "message" (gửi DM).
+            if post_shares_has_shared_from_share_id_column():
+                share_count = PostShare.objects.filter(
+                    post_id=post.id,
+                    share_type__in=["personal", "message"],
+                    shared_from_share_id__isnull=True,
+                ).count()
+            else:
+                share_count = PostShare.objects.filter(
+                    post_id=post.id,
+                    share_type__in=["personal", "message"],
+                ).count()
+            
+            post_data = {
+                "id": post.id,
+                "title": post.title,
+                "description": post.description,
+                "original_text": post.original_text,
+                "summary_text": post.summary_text,
+                "dialogue_script": post.dialogue_script,
+                "transcript_text": post.transcript_text,
+                "author": author_name,
+                "author_id": post.user.id,
+                "author_avatar": author_avatar,
+                "thumbnail_url": post.thumbnail_url,
+                "audio_url": post.audio_url,
+                "listen_count": post.listen_count,
+                "view_count": post.view_count,
+                "download_count": post.download_count,
+                "duration_seconds": post.duration_seconds,
+                "learning_field": post.learning_field,
+                "status": post.status,
+                "visibility": post.visibility,
+                "language_code": post.language_code,
+                "source_type": post.source_type,
+                "is_ai_generated": post.is_ai_generated,
+                "created_at": post.created_at.isoformat(),
+                "published_at": post.published_at.isoformat() if post.published_at else None,
+                "updated_at": post.updated_at.isoformat() if post.updated_at else None,
+                "like_count": like_count,
+                "comment_count": comment_count,
+                "save_count": save_count,
+                "share_count": share_count,
+                "is_liked": is_liked,
+                "is_saved": is_saved,
+                "tags": [{"id": tag.id, "name": tag.name, "slug": tag.slug} for tag in Tag.objects.filter(tag_posts__post_id=post.id)],
+            }
+            
+            return Response({
+                "data": post_data,
+                "success": True
+            }, status=status.HTTP_200_OK)
+        except Post.DoesNotExist:
+            return Response({
+                "error": "Post not found",
+                "data": None
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({
+                "error": f"Failed to load post: {str(e)}",
+                "data": None
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+               
+class PublishPostView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _resolve_duration_seconds(self, data, fallback_text=""):
+        duration_seconds = data.get("duration_seconds")
+
+        if duration_seconds not in (None, ""):
+            try:
+                return int(float(duration_seconds))
+            except (TypeError, ValueError):
+                pass
+
+        public_id = data.get("public_id")
+        if public_id:
+            duration_seconds = get_audio_duration_from_api(public_id, resource_type="video")
+            if duration_seconds not in (None, ""):
+                try:
+                    return int(float(duration_seconds))
+                except (TypeError, ValueError):
+                    pass
+
+        return estimate_duration_seconds(fallback_text)
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = PublishPostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            if data.get("draft_id"):
+                post = Post.objects.get(
+                    id=data["draft_id"],
+                    user=request.user,
+                )
+            else:
+                post = Post.objects.create(
+                    id=str(ulid.new()),
+                    user=request.user,
+                    slug=generate_unique_slug(data["title"]),
+                    created_at=timezone.now(),
+                    updated_at=timezone.now(),
+                )
+
+            post.title = data["title"]
+            post.description = data.get("description")
+            post.original_text = data.get("original_text")
+            post.transcript_text = data.get("transcript_text")
+            post.source_type = data.get("source_type", "ai_generated")
+            post.is_ai_generated = data.get("is_ai_generated", True)
+            post.audio_url = data["audio_url"]
+            post.thumbnail_url = data.get("thumbnail_url")
+
+            fallback_text = (
+                data.get("summary_text")
+                or data.get("dialogue_script")
+                or data.get("transcript_text")
+                or data.get("original_text")
+                or ""
+            )
+            post.duration_seconds = self._resolve_duration_seconds(data, fallback_text)
+            
+            post.learning_field = data.get("learning_field")
+            post.visibility = data.get("visibility", "public")
+            post.status = Post.StatusChoices.PROCESSING
+            post.published_at = None
+            post.updated_at = timezone.now()
+            post.slug = generate_unique_slug(post.title)
+
+            post.save()
+
+            # TOPICS
+            handle_topics(
+                post=post,
+                topic_ids=data.get("topic_ids", []),
+            )
+
+            # TAGS
+            post.post_tags.all().delete()
+            handle_tags(post, data.get("tags", []))
+
+            # CREATE NOTIFICATIONS FOR ADMINS
+            create_new_post_notifications_for_admins(post, request.user)
+
+            from apps.users.utils import log_user_activity
+            log_user_activity(request.user.id, 'created_post', 'post', post.id)
+
+            return Response(
+                {
+                    "message": "Bài viết đã được lưu và gửi cho admin kiểm duyệt",
+                    "post_id": post.id,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except Post.DoesNotExist:
+            return Response(
+                {"error": "Không tìm thấy draft để publish"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+class TopicListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        topics = Topic.objects.annotate(
+            usage_count=models.Count("topic_posts", distinct=True)
+        ).order_by("-usage_count", "name")
+        serializer = TopicSerializer(topics, many=True)
+        data = list(serializer.data)
+        usage_by_id = {str(topic.id): topic.usage_count for topic in topics}
+        for item in data:
+            item["usage_count"] = usage_by_id.get(str(item.get("id")), 0)
+        return Response(
+            {
+                "message": "Lấy danh sách topics thành công",
+                "data": data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class TagListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        """
+        Trả về danh sách tất cả tags trong hệ thống, sắp xếp theo tên.
+        Hỗ trợ tìm kiếm qua query param ?q=<keyword>.
+        """
+        q = (request.query_params.get("q") or "").strip().lower()
+        tags = Tag.objects.all().order_by("name")
+        if q:
+            tags = tags.filter(name__icontains=q)
+        serializer = TagSerializer(tags, many=True)
+        return Response(
+            {
+                "message": "Lấy danh sách tags thành công",
+                "data": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+class PostRequestRepublishView(APIView):
+    """
+    User requests to republish a rejected post (status 'failed').
+    Only allowed if rejection_count (learning_field) is 1.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, post_id):
+        try:
+            post = Post.objects.get(id=post_id, user=request.user)
+        except Post.DoesNotExist:
+            return Response(
+                {"error": "Không tìm thấy bài viết."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if post.status != Post.StatusChoices.FAILED:
+            return Response(
+                {"error": "Chỉ có thể yêu cầu đăng lại bài viết bị từ chối."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            rejection_count = int(post.learning_field or "0")
+        except (ValueError, TypeError):
+            rejection_count = 0
+
+        if rejection_count >= 2:
+            return Response(
+                {"error": "Bài viết này đã bị từ chối 2 lần và không thể yêu cầu đăng lại."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Set status back to processing for admin to review again
+        post.status = Post.StatusChoices.PROCESSING
+        post.updated_at = timezone.now()
+        post.save()
+
+        # Create notification for admins
+        create_new_post_notifications_for_admins(post, request.user)
+
+        return Response(
+            {
+                "message": "Đã gửi yêu cầu đăng lại bài viết.",
+                "post": {
+                    "id": post.id,
+                    "status": post.status,
+                }
+            },
+            status=status.HTTP_200_OK,
+        )

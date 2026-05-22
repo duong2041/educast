@@ -1,0 +1,229 @@
+/* ── VoiceConfigCard — matches PublishPostPage design system ── */
+
+.card {
+  border-radius: 22px;
+  background: linear-gradient(180deg, rgba(39, 45, 88, 0.98) 0%, rgba(30, 35, 68, 0.98) 100%);
+  border: 1px solid rgba(245, 240, 232, 0.08);
+  padding: 22px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+}
+
+.cardHeader {
+  margin-bottom: 20px;
+}
+
+.cardTitle {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #f5f0e8;
+}
+
+/* ── Section spacing ── */
+.section {
+  margin-bottom: 20px;
+}
+
+.section:last-child {
+  margin-bottom: 0;
+}
+
+.label {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #f5f0e8;
+}
+
+/* ── Voice buttons grid ── */
+.voiceGrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.voiceBtn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(245, 240, 232, 0.11);
+  background: rgba(8, 12, 27, 0.74);
+  color: #f5f0e8;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.voiceBtn:hover:not(:disabled) {
+  border-color: rgba(244, 162, 39, 0.35);
+  background: rgba(244, 162, 39, 0.06);
+}
+
+.voiceBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.voiceBtnActive {
+  border-color: #f4a227;
+  background: rgba(244, 162, 39, 0.12);
+  box-shadow: 0 0 0 3px rgba(244, 162, 39, 0.1);
+}
+
+.voiceName {
+  font-size: 14px;
+  font-weight: 700;
+  color: #f5f0e8;
+}
+
+.voiceBtnActive .voiceName {
+  color: #f4a227;
+}
+
+.voiceTag {
+  font-size: 12px;
+  color: rgba(245, 240, 232, 0.52);
+}
+
+/* ── Format select ── */
+.select {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid rgba(245, 240, 232, 0.11);
+  border-radius: 14px;
+  background: rgba(8, 12, 27, 0.74);
+  color: #f5f0e8;
+  padding: 0 14px;
+  font-size: 14px;
+  font-weight: 600;
+  outline: none;
+  appearance: none;
+  cursor: pointer;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='rgba(245,240,232,0.5)' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  padding-right: 36px;
+}
+
+.select:hover {
+  border-color: rgba(244, 162, 39, 0.35);
+  background-color: rgba(12, 17, 36, 0.82);
+}
+
+.select:focus {
+  border-color: #f4a227;
+  box-shadow: 0 0 0 3px rgba(244, 162, 39, 0.1);
+  background-color: rgba(8, 12, 27, 0.86);
+}
+
+.select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.select option {
+  background: #1a2442;
+  color: #f5f0e8;
+}
+
+/* ── Topic chips ── */
+.topicList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.topicChip {
+  padding: 7px 13px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 240, 232, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(245, 240, 232, 0.68);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease,
+    color 0.16s ease;
+}
+
+.topicChip:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(244, 162, 39, 0.3);
+  background: rgba(244, 162, 39, 0.1);
+  color: #f4a227;
+}
+
+.topicChip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.topicChipActive {
+  background: linear-gradient(135deg, rgba(244, 162, 39, 0.22), rgba(255, 106, 61, 0.22));
+  border-color: #f4a227;
+  color: #f4a227;
+  box-shadow: 0 6px 14px rgba(244, 162, 39, 0.14);
+}
+
+.topicEmpty {
+  color: rgba(245, 240, 232, 0.38);
+  font-size: 13px;
+}
+
+/* ── Ant Design Select wrapper cho Topics ── */
+.topicSelect :global(.ant-select-selector) {
+  min-height: 44px !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(245, 240, 232, 0.11) !important;
+  background: rgba(8, 12, 27, 0.74) !important;
+  color: #f5f0e8 !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035) !important;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease !important;
+  padding: 6px 10px !important;
+}
+
+.topicSelect:hover :global(.ant-select-selector) {
+  border-color: #f4a227 !important;
+  background: rgba(12, 17, 36, 0.82) !important;
+}
+
+.topicSelect:global(.ant-select-focused) :global(.ant-select-selector),
+.topicSelect :global(.ant-select-selector:focus-within) {
+  border-color: #f4a227 !important;
+  background: rgba(8, 12, 27, 0.86) !important;
+  box-shadow:
+    0 0 0 3px rgba(244, 162, 39, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045) !important;
+}
+
+/* ── Responsive ── */
+@media (max-width: 640px) {
+  .voiceGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .card {
+    padding: 16px;
+    border-radius: 18px;
+  }
+
+  .cardTitle {
+    font-size: 18px;
+  }
+}
